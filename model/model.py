@@ -71,7 +71,7 @@ def repeat_kv(x: torch.Tensor, n_repeat: int) -> torch.Tensor:
         return x 
     return x[:, :, :, None, :].expand(batch_size, seq_len, n_kv_heads, n_repeat, head_dim).reshape(batch_size, seq_len, n_kv_heads * n_repeat, head_dim)
 
-class Attaintion(nn.Module):
+class Attention(nn.Module): 
     def __init__(self, args: LMConfig):
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is not None else args.n_kv_heads
