@@ -8,8 +8,9 @@ class LMConfig(PretrainedConfig):
             self,
             dim: int=512,
             n_layers: int=8,
-            n_heads: int=16,
-            n_kv_heads: int=8,
+            n_heads: int=16,   # 总注意力头数（查询头数量），决定query向量的并行计算能力
+            n_kv_heads: int=8, # 键/值头的数量，决定key/value向量的复用程度
+            # 每个key/value头会被多个query头共享（本例中16/8=2个query头共享1个key/value头，这个比例和标准transformer相比降低了50%参数量）
             vocab_size: int=6400,
             hidden_dim: int=None,
             multiple_of: int=64,

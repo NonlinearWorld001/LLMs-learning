@@ -58,7 +58,7 @@ def apply_rotary_embedding(xq, xk, pos_cis):
     xk_out = torch.view_as_real(x_k * pos_cis).flatten(3) # 对 x_k 矩阵操作同上
     return xq_out.type_as(xq), xk_out.type_as(xk) # 按照原有的数据类型输出，保证计算的一致性
 
-# kv头复制器：查询头数和键值头数会存在不一样的情况
+# kv头复制器：查询头数和键值头数会存在不一样的情况（当键值头数量少于查询头时）， 该函数将键值头的特征复制n_repeat次，使得键值头的数量和查询头的数量一致
 def repeat_kv(x: torch.Tensor, n_repeat: int) -> torch.Tensor:
     # 获取输入张量的形状，其中：
     # batch_size: 批量大小
@@ -70,13 +70,37 @@ def repeat_kv(x: torch.Tensor, n_repeat: int) -> torch.Tensor:
     if n_repeat == 1:
         return x 
     return x[:, :, :, None, :].expand(batch_size, seq_len, n_kv_heads, n_repeat, head_dim).reshape(batch_size, seq_len, n_kv_heads * n_repeat, head_dim)
+    # x[:, :, :, None, :]：在每个头维度上增加一个维度，扩展为[batch_size, seq_len, n_kv_heads, 1, head_dim]
+    # expand(...):广播机制扩展维度，重复引用head_dim维度，扩展为[batch_size, seq_len, n_kv_heads, n_repeat, head_dim]
+    # reshape(...):将扩展后的张量展平为[batch_size, seq_len, n_kv_heads * n_repeat, head_dim]
 
+# 注意力层(类)， 这里使用的是分组注意力机制，和LLAMA的注意力机制类似
 class Attention(nn.Module): 
     def __init__(self, args: LMConfig):
         super().__init__()
-        self.n_kv_heads = args.n_heads if args.n_kv_heads is not None else args.n_kv_heads
-        assert args.n_heads % self.n_kv_heads == 0
-        self.n_local_heads = args.n_heads
-        self.n_local_kv_heads = self.n_kv_heads
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads
-        self.head_dim = args.dim // args.n_heads
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is not None else args.n_kv_heads # 如果键值头数量为None，则使用查询头数量
+        assert args.n_heads % self.n_kv_heads == 0 # 确保查询头数量是键值头数量的整数倍，这是为了矩阵乘法时，键值头数量和查询头数量一致
+        self.n_local_heads = args.n_heads # 查询头数量
+        self.n_local_kv_heads = self.n_kv_heads # 键值头数量
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads # 每个键值头对应的查询头数量，即用于输入repeat_kv的n_repeat参数
+        self.head_dim = args.dim // args.n_heads # 每个头的维度，注意力模块的总维度由所有注意力头平分
+
+        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False) # 查询权重矩阵，输入维度为dim，输出维度为n_heads * head_dim，是n_heads个head_dim的并行计算，无偏置的线性变换层
+        self.wk = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False) # 键权重矩阵，输入维度为dim，输出维度为n_heads * head_dim，是n_heads个head_dim的并行计算，无偏置的线性变换层
+        self.wv = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False) # 值权重矩阵，输入维度为dim，输出维度为n_heads * head_dim，是n_heads个head_dim的并行计算，无偏置的线性变换层    
+        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False) # 输出权重矩阵，输入维度为n_heads * head_dim，输出维度为dim，是n_heads个head_dim的并行计算，无偏置的线性变换层
+        self.k_cache, self.v_chache = None, None # 键值缓存，用于存储当前状态之前的时间步的键和值的缓存，加速推理过程
+
+        self.attn_dropout = nn.Dropout(args.dropout) # 注意力概率矩阵的随机失活层，在注意力权重s矩阵oftmax输出之后，在训练时随机丢弃部分注意力连接，防止模型过度依赖局部模式
+        self.resid_dropout = nn.Dropout(args.dropout) # 残差连接的随机失活层，在注意力输出与残差连接相加之后，在训练时随机丢弃部分残差连接，防止网络过度适应特定路径，增强模型鲁棒性
+        self.dropout = args.dropout # 随机失活的正则化比例，本质是在防止过拟合
+        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention") and args.flash_attn 
+        # hasattr函数，用于检查某个对象是否具有某个属性或方法
+        # 检查当前环境是否支持 Flash Attention， 并根据配置决定是否启用 Flash Attention（Flash Attention 是一种高效的注意力机制实现，利用分块计算和内存优化，能够显著加速 Transformer 模型中的注意力计算）
+
+        mask = torch.full((1, 1, args.max_seq_length, args.max_seq_length), float("-inf")) # 4维张量适配多头注意力机制，生成一个形状为(batch, head, seq, seq)的掩码，用于屏蔽未来信息
+        # 在自注意力机制中，softmax函数用于计算注意力权重，它将输入值转换为概率分布。如果掩码位置的值是 -inf，softmax函数会将这些位置的输出概率推向0，从而有效地忽略这些位置。
+        mask =torch.triu(mask, diagonal=1)  # 保留上三角部分（实现因果注意力），下三角为0，表示允许注意力，这保证了只能看到当前位置及之前的部分的token（未来的状态仅由当前的状态决定）
+        self.register_buffer("mask", mask, persistent=False) # 将掩码注册为（不可学习的）模型参数，仅在推理时使用，避免在每次前向传播时重新计算
+        
+        
