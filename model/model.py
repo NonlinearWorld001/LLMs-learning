@@ -150,10 +150,16 @@ class Attention(nn.Module):
                                                                       is_causal=True)
         else:# 在flash不可用或序列长度为1时，使用标准实现
             attn_weights = torch.matmul(xq, xk.transpose(2, 3))/ math.sqrt(self.head_dim) # 计算注意力权重矩阵
+            # 此时attn_weights的形状为[batch_size, n_local_heads, seq_len, seq_len]
             attn_weights = attn_weights + self.mask[:, :, :seqlen, :seqlen] # 添加掩码
+            # 此时attn_weights的形状为[batch_size, n_local_heads, seq_len, seq_len]
             attn_weights = F.softmax(attn_weights, dim=-1).type_as(xq) # 对注意力权重进行归一化处理
+            # 此时attn_weights的形状为[batch_size, n_local_heads, seq_len, seq_len]
             attn_weights = self.attn_dropout(attn_weights) # 应用注意力概率矩阵的随机失活层
+            # 此时attn_weights的形状为[batch_size, n_local_heads, seq_len, seq_len]
             output = torch.matmul(attn_weights, xv) # 计算加权值向量
+            # xv的形状为[batch_size, n_local_kv_heads, seq_len, head_dim]
+            # output的形状为[batch_size, n_local_heads, seq_len, head_dim]
 
         '''
         |        场景        |      训练模式     |      推理模式     |
