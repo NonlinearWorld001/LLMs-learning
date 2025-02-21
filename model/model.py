@@ -37,8 +37,8 @@ def precompute_pos_cis(dim: int, end:int, theta: float=10000.0):
     # 为什么隔2取数？ 每个复数可以对应两个维度的旋转。
     # 截取前 dim//2 个元素？ 确保频率向量的长度是 dim//2，因为每个复数可以对应两个维度的旋转。
     # 为什么除以dim？ 归一化操作，保证不同维度下的频率一致性。
-    t = torch.arange(end, device=freqs.device) # 生成序列（的数轴位置）
-    freqs = torch.outer(t, freqs).float()
+    t = torch.arange(end, device=freqs.device) # 生成序列（的数轴位置）向量
+    freqs = torch.outer(t, freqs).float() # 生成频率矩阵，每个元素表示对应位置的频率
     pos_cis = torch.polar(torch.ones_like(freqs), freqs)
     return pos_cis
 
@@ -86,10 +86,10 @@ class Attention(nn.Module):
         self.head_dim = args.dim // args.n_heads # 每个头的维度，注意力模块的总维度由所有注意力头平分
 
         self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False) # 查询权重矩阵，输入维度为dim，输出维度为n_heads * head_dim，是n_heads个head_dim的并行计算，无偏置的线性变换层
-        self.wk = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False) # 键权重矩阵，输入维度为dim，输出维度为n_heads * head_dim，是n_heads个head_dim的并行计算，无偏置的线性变换层
-        self.wv = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False) # 值权重矩阵，输入维度为dim，输出维度为n_heads * head_dim，是n_heads个head_dim的并行计算，无偏置的线性变换层    
+        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False) # 键权重矩阵，输入维度为dim，输出维度为n_kv_heads * head_dim，是n_kv_heads个head_dim的并行计算，无偏置的线性变换层
+        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False) # 值权重矩阵，输入维度为dim，输出维度为n_kv_heads * head_dim，是n_kv_heads个head_dim的并行计算，无偏置的线性变换层    
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False) # 输出权重矩阵，输入维度为n_heads * head_dim，输出维度为dim，是n_heads个head_dim的并行计算，无偏置的线性变换层
-        self.k_cache, self.v_chache = None, None # 键值缓存，用于存储当前状态之前的时间步的键和值的缓存，加速推理过程
+        self.k_cache, self.v_cache = None, None # 键值缓存，用于存储当前状态之前的时间步的键和值的缓存，加速推理过程
 
         self.attn_dropout = nn.Dropout(args.dropout) # 注意力概率矩阵的随机失活层，在注意力权重s矩阵oftmax输出之后，在训练时随机丢弃部分注意力连接，防止模型过度依赖局部模式
         self.resid_dropout = nn.Dropout(args.dropout) # 残差连接的随机失活层，在注意力输出与残差连接相加之后，在训练时随机丢弃部分残差连接，防止网络过度适应特定路径，增强模型鲁棒性
@@ -101,6 +101,57 @@ class Attention(nn.Module):
         mask = torch.full((1, 1, args.max_seq_length, args.max_seq_length), float("-inf")) # 4维张量适配多头注意力机制，生成一个形状为(batch, head, seq, seq)的掩码，用于屏蔽未来信息
         # 在自注意力机制中，softmax函数用于计算注意力权重，它将输入值转换为概率分布。如果掩码位置的值是 -inf，softmax函数会将这些位置的输出概率推向0，从而有效地忽略这些位置。
         mask =torch.triu(mask, diagonal=1)  # 保留上三角部分（实现因果注意力），下三角为0，表示允许注意力，这保证了只能看到当前位置及之前的部分的token（未来的状态仅由当前的状态决定）
-        self.register_buffer("mask", mask, persistent=False) # 将掩码注册为（不可学习的）模型参数，仅在推理时使用，避免在每次前向传播时重新计算
+        self.register_buffer("mask", mask, persistent=False) # 将掩码注册为（不可学习的）模型参数，仅在推理时使用，避免在每次前向传播时重新计算，persistent=False则表明掩码不被存入模型的state_dict中，每次动态生成。
+
+    '''
+    * 网络结构示意图：
+                   输入 → wq → Q       ──┐       
+                   输入 → wk → K → repeat_kv → K' ──┤ scaled_dot_product_attention → 输出 → wo → 最终输出
+                   输入 → wv → V → repeat_kv → V' ──┘
+    '''
+    
+    # Attention中的前向传播函数（方式）  
+    def forward(self, x:torch.Tensor, pos_cis:torch.Tensor, kv_cache=False):
+        bch_size, seqlen, _ = x.shape # 获取输入张量的batch_size和seq_len, x 的形状为[batch_size, seq_len, dim]
+
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x) # 将输入张量 x 分别通过 wq、wk 和 wv 线性变换层，得到查询向量Q、键向量K、值向量V
+        xq = xq.view(bch_size, seqlen, self.n_local_heads, self.head_dim) # 将查询向量Q、键向量K、值向量V展平为(batch_size, seq_len, n_local_heads, head_dim)
+        xk = xk.view(bch_size, seqlen, self.n_local_kv_heads, self.head_dim) # 将键向量K、值向量V展平为(batch_size, seq_len, n_local_kv_heads, head_dim)
+        xv = xv.view(bch_size, seqlen, self.n_local_kv_heads, self.head_dim) # 将值向量V展平为(batch_size, seq_len, n_local_kv_heads, head_dim)
+
+        xq, xk = apply_rotary_embedding(xq, xk, pos_cis) # 将查询向量Q、键向量K应用旋转位置编码
+
+        # 一种更加高效的推理方式，在推理时，使用键值缓存来加速推理过程
+        # 避免重复计算：历史token的键值不再重新计算，而是直接使用缓存中的值
+        # 内存效率：只需存储O(n)的键值缓存，而非O(n²)的注意力矩阵
+        if kv_cache and self.eval(): # 如果kv_cache为True(即存在k_cache和v_cache)，并且模型处于推理模式
+            if seqlen == 1 and all(cache is not None for cache in (self.k_cache, self.v_cache)): # 如果序列长度为1(表示在自回归阶段，正在生成单个新token)，并且k_cache和v_cache都存在
+                xk = torch.cat((self.k_cache, xk), dim=1) # 把k_cache和xk沿着第一维拼接起来,将当前计算的键与历史缓存拼接，保持完整的上下文记忆
+                xv = torch.cat((self.v_cache, xv), dim=1) # 把v_cache和xv沿着第一维拼接起来,将当前计算的值与历史缓存拼接，保持完整的上下文记忆
+            self.k_cache, self.v_cache = xk, xv # 更新k_cache和v_cache,提供一个新的当前状态
+
+        xk = repeat_kv(xk, self.n_rep) # 将键向量K复制n_rep次，使得键值头的数量和查询头的数量一致
+
+        xq = xq.transpose(1, 2) 
+        xk = xk.transpose(1, 2)
+        xv = xv.transpose(1, 2)
+        # 将xq、xk、xv的维度从[batch_size, seq_len, n_local_heads, head_dim]转换为[batch_size, n_local_heads, seq_len, head_dim]
         
+        if self.flash and seqlen != 1:
+            output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+        else:
+            attn_weights = torch.matmul(xq, xk.transpose(2, 3))/ math.sqrt(self.head_dim) # 计算注意力权重矩阵
+            attn_weights = attn_weights + self.mask[:, :, :seqlen, :seqlen] # 添加掩码
+            attn_weights = F.softmax(attn_weights, dim=-1).type_as(xq) # 对注意力权重进行归一化处理
+            attn_weights = self.attn_dropout(attn_weights) # 应用注意力概率矩阵的随机失活层
+            output = torch.matmul(attn_weights, xv) # 计算加权值向量
+
+        output = output.transpose(1, 2).contiguous().view(bch_size, seqlen, -1  ) # 将输出展平为[batch_size, seq_len, dim]
+        output = self.wo(output) # 将输出通过输出权重矩阵
+        output = self.resid_dropout(output) # 应用残差连接的随机失活层
+        return output
+            
+
         
+
+                
