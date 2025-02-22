@@ -104,7 +104,7 @@ class Attention(nn.Module):
         self.register_buffer("mask", mask, persistent=False) # 将掩码注册为（不可学习的）模型参数，仅在推理时使用，避免在每次前向传播时重新计算，persistent=False则表明掩码不被存入模型的state_dict中，每次动态生成。
 
     '''
-    * 网络结构示意图：
+    * 神经网络结构示意：
                    输入 → wq → Q       ──┐       
                    输入 → wk → K → repeat_kv → K' ──┤ scaled_dot_product_attention → 输出 → wo → 最终输出
                    输入 → wv → V → repeat_kv → V' ──┘
@@ -174,7 +174,45 @@ class Attention(nn.Module):
         output = self.resid_dropout(output) # 应用残差连接的随机失活层
         return output
             
+# 前馈神经网络层(类)：SwiGLU（Swish-Gated Linear Unit）前馈网络结构
+class FeedForward(nn.Module):
+    def __init__(self, dim:int, hidden_dim:int=None, multiple_of:int=128, drop_out:float=0.0):
+        '''
+        dim: 输入特征的维度
+        hidden_dim: 隐藏层的维度,通常是输入特征维度的4倍
+        multiple_of: 隐藏层维度的倍数,通常是128
+        drop_out: 随机失活层的概率
+        '''
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = 4 * dim # 由 transformer论文：隐藏层维度通常是输入特征维度的4倍，方可以提供足够的表达能力
+            hidden_dim = int(2 * hidden_dim / 3) # 2/3缩放：在使用SwiGLU等更高效的激活函数时，适当缩小隐藏层维度（约2.66x）依旧可以保持模型的性能，在参数上则可以减少约33%的参数计算量
+            hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of) # 向上取整，并且是multiple_of(一般是128)的倍数，目的是实现GPU内存访问对齐和计算效率优化
+                                                                                       # ⌈a / b⌉ = ⌊( a + b - 1 ) / b⌋  <--- 向上取整的公式
 
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False) # 升维层，处理输入，把输入特征升维到hidden_dim，提供给隐藏层处理，负责提取基础特征
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False) # 降维层，处理隐藏层的输出，把隐藏层的输出降维到dim，提供给残差连接
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False) # 门控层，与w1形成并行结构，负责控制信息流动，生成动态调节系数，提供非线性变换
+                                                         # 门控信号根据输入 x 实时生成，使模型能自适应增强重要特征、抑制噪声（如某些语义或空间位置的特征），类似于注意力机制，可以对输入特征进行动态加权
+
+        self.dropout = nn.Dropout(drop_out) # 随机失活层，在输出层之前应用，防止过拟合
+    '''
+        FeedForward 网络结构示意：
+                      输入
+                        ├─ w1 → Silu激活 ─┐
+                        │                │ 逐元素相乘 → w2 → Dropout → 输出
+                        └─ w3 → 门控系数 ─┘
+    '''
+    def forward(self, x:torch.Tensor):
+        return self.dropout( # 4. 最终输出正则化
+            self.w2( # 3. 降维到原始维度
+                F.silu(self.w1(x)) # 1. 升维+SwiGLU激活
+                 * self.w3(x) # 2. 并行门控机制
+            ) 
+        )   
+             
+
+            
         
 
                 
