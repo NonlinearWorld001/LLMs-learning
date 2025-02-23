@@ -83,8 +83,9 @@ class Attention(nn.Module):
         self.n_local_heads = args.n_heads # 查询头数量，默认16
         self.n_local_kv_heads = self.n_kv_heads # 键值头数量，默认8
         self.n_rep = self.n_local_heads // self.n_local_kv_heads # 每个键值头对应的查询头数量，即用于输入repeat_kv的n_repeat参数
-        self.head_dim = args.dim // args.n_heads # 每个头的维度，注意力模块的总维度由所有注意力头平分， 默认512/16=32
+        self.head_dim = args.dim // args.n_heads # 每个头的维度，注意力模块的总维度由所有查询注意力头平分，默认512/16=32
 
+        # 权重矩阵的本质作用是通过线性变换，将输入的特征维度映射到输出特征维度，从而实现特征的升维或降维
         self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False) # 查询权重矩阵，输入维度为dim，输出维度为n_heads * head_dim，是n_heads个head_dim的并行计算，无偏置的线性变换层
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False) # 键权重矩阵，输入维度为dim，输出维度为n_kv_heads * head_dim，是n_kv_heads个head_dim的并行计算，无偏置的线性变换层
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False) # 值权重矩阵，输入维度为dim，输出维度为n_kv_heads * head_dim，是n_kv_heads个head_dim的并行计算，无偏置的线性变换层    
@@ -120,6 +121,7 @@ class Attention(nn.Module):
                                       [13,14,15,16, ...]] <--序列2 ]
         '''
 
+        # 按注意力头拆分特征
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x) # 将输入张量 x 分别通过 wq、wk 和 wv 线性变换层，得到查询向量Q、键向量K、值向量V
         xq = xq.view(bch_size, seqlen, self.n_local_heads, self.head_dim) # 将查询向量Q、键向量K、值向量V展平为(batch_size, seq_len, n_local_heads, head_dim)
         xk = xk.view(bch_size, seqlen, self.n_local_kv_heads, self.head_dim) # 将键向量K、值向量V展平为(batch_size, seq_len, n_local_kv_heads, head_dim)
@@ -149,7 +151,7 @@ class Attention(nn.Module):
                                                                       dropout_p=self.dropout if self.training else 0.0, 
                                                                       is_causal=True)
         else:# 在flash不可用或序列长度为1时，使用标准实现
-            attn_weights = torch.matmul(xq, xk.transpose(2, 3))/ math.sqrt(self.head_dim) # 计算注意力权重矩阵
+            attn_weights = torch.matmul(xq, xk.transpose(2, 3))/ math.sqrt(self.head_dim) # 计算注意力权重矩阵，[batch_size, n_local_heads, seq_len, head_dim] * [batch_size, n_local_heads, head_dim, seq_len] 
             # 此时attn_weights的形状为[batch_size, n_local_heads, seq_len, seq_len]
             attn_weights = attn_weights + self.mask[:, :, :seqlen, :seqlen] # 添加掩码
             # 此时attn_weights的形状为[batch_size, n_local_heads, seq_len, seq_len]
@@ -209,10 +211,101 @@ class FeedForward(nn.Module):
                 F.silu(self.w1(x)) # 1. 升维+SwiGLU激活
                  * self.w3(x) # 2. 并行门控机制
             ) 
-        )   
-             
+        ) 
 
-            
+
+# 混合专家门控机制层(类)
+class  MOEGate(nn.Module):
+    def __init__(self, config:LMConfig):
+        super().__init__()
+        self.config = config # 配置参数
+        self.top_k = config.num_experts_per_token # 每个token被路由的专家数量(即处理每个token需要的专家数量)
+        self.n_routed_experts = config.n_routed_experts # 模型中参与路由的专家总数量，决定了有多少个专家会被用于处理数据(参与路由过程，参与路由专家越多，模型越复杂)
+
+        self.scoring_func = config.scoring_func # 评分函数，默认为'softmax'
+        self.alpha = config.aux_loss_alpha # 辅助损失的alpha参数，用于控制辅助损失的权重，辅助损失的权重越大，模型越倾向于学习专家的分布，从而提高模型的泛化能力
+        self.seq_aux = config.seq_aux # 是否在序列级别上计算辅助损失，bool类型，默认为False
+
+        self.norm_topk_prob = config.norm_topk_prob # 是否标准化top-k概率,即是否对每个token的专家选择概率进行归一化
+        self.gate_dim = config.dim # 门控层的维度，决定了门控层的输入维度==token特征维度
+        self.weight = nn.Parameter(torch.empty(self.n_routed_experts, self.gate_dim)) # 权重矩阵，用于存储每个专家的权重
+        self.reset_parameters() # 重置参数
+
+    def reset_parameters(self):
+        import torch.nn.init as init # 仅在本函数中使用该包，避免污染全局命名空间，同时优化内存
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5)) # 使用Kaiming初始化方法，均匀分布初始化权重矩阵
+
+    def forward(self, hidden_states:torch.Tensor):
+        # hidden_states: 输入到门控机制的特征表示，形状为[batch_size, seq_len, hidden_dim==token's feature_dim]
+        if not hidden_states.is_contiguous():
+            hidden_states = hidden_states.contiguous() # 确保输入张量是连续的，避免在计算过程中出现非连续内存访问
+
+        batch_size, seq_len, hidden_dim = hidden_states.shape # 获取输入张量的batch_size和seq_len、hidden_dim
+        
+        hidden_states = hidden_states.view(-1, hidden_dim) # shape: [batch_size, seq_len, hidden_dim] --> [batch_size * seq_len, hidden_dim]
+        logits = F.linear(hidden_states, self.weight) # 对hidden_states以self.weight为权重矩阵进行线性变换，计算每个专家的得分
+        # logits的形状为[batch_size * seq_len, n_routed_experts]
+
+        if self.scoring_func == 'softmax':
+            scores = F.softmax(logits, dim=-1)
+            # scores的形状为[batch_size * seq_len, n_routed_experts]，但是最后一维的值和为1，对于每一个专家的权重(score)已经被归一化/激活,转为概率分布
+        else:
+            raise NotImplementedError(f"scoring_func {self.scoring_func} not implemented in MOEGate")# only support softmax now
+        
+        # torch.topk函数：用于返回张量中最大或最小的k个元素，并返回它们的值和索引
+        # 输入格式： torch.topk(input:输入的张量, k:返回的元素数量, dim:沿着哪个维度进行操作, larges:默认为True,表示返回最大值，若为False,则返回最小值, sorted:是否排序, out:可选参数，用于存储输出结果)
+        topk_scores, topk_index = torch.topk(scores, k=self.top_k, dim=-1, sorted=True) # 返回每个token所应该使用的概率最高的k=self.top_k个专家的权重和索引
+        # topk_scores的形状为[batch_size * seq_len, top_k], 数据类型为torch.float32
+        # topk_index的形状为[batch_size * seq_len, top_k], 数据类型为torch.int64
+        
+        if self.top_k > 1 and self.norm_topk_prob: #如果决定每个token的输出专家数量大于1，并且需要对每个token的专家选择概率进行归一化，这样做可以更加精确地计算专家负载，保证梯度传播的稳定性，同时也能避免因概率稀释导致的训练不稳定
+            denominator = topk_scores.sum(dim=-1, keepdim=True) + 1e-20 # 计算归一化所用的分母，+1e-20是为了防止分母为0
+            topk_scores = topk_scores / denominator # 归一化
+
+        if self.training and self.alpha > 0: # 如果处于训练模式，并且alpha大于0，则计算辅助损失：最终目的是防止"专家僵死"问题，提升所有专家的利用率，增强模型容量
+            scores_aux = scores # 辅助损失的所有专家的得分，形状为[batch_size * seq_len, n_routed_experts]
+            aux_topk = self.top_k # 辅助损失的专家数量
+            topk_index_aux_loss = topk_index.view(batch_size, -1) # 把辅助损失的专家索引按照batch分好，[batch_size * seq_len, top_k] --> [batch_size, seq_len * top_k]
+            if self.seq_aux: # 如果需要计算序列级别的辅助损失
+                scores_seq_aux = scores_aux.view(batch_size, seq_len, -1) # 再把辅助损失的得分按照batch和seq_len分好，[batch_size * seq_len, n_routed_experts] --> [batch_size, seq_len, n_routed_experts]
+                ce = torch.zeros(batch_size, self.n_routed_experts, device=hidden_states.device)# 创建一个形状为[batch_size, n_routed_experts]的计数张量ce，用于存储每个专家的计数
+                
+                # 使用散射加法统计每个专家被选中的次数：
+                # 统计每个batch中每个专家被选中的相对频率，将实际选中次数与期望次数（假设均匀分布）的比例作为监督信号，最终辅助损失会计算该比例与1的均方误差
+                # 防止某些专家长期不被选择（"专家僵死"问题），避免热门专家被过度选择，提升所有专家的利用率，增强模型容量；通过超参数alpha控制负载均衡与任务损失的平衡
+                ce.scatter_add_( #ce: 目标张量, [batch_size, n_routed_experts]
+                    -1, # 操作维度，分散计算对应的索引则为ce[-1,topk_index_aux_loss的索引[1, x(x会遍历每一个索引)]对应的值]
+                    topk_index_aux_loss,  # 专家索引 [batch_size, seq_len*top_k]
+                    torch.ones(batch_size, seq_len*aux_topk, device=hidden_states.device) # 要累加的值（每个位置都是1）
+                ).div_(seq_len*aux_topk/self.n_routed_experts) # 每个专家被选择的相对频率 = 除以[(序列长度*top_k)/ 专家总数] = [每个样本（batch）所有token的总选择次数]/专家综述 = 实际选择次数/期望选择次数 = 实际选择次数/(总选择机会/专家总数)
+                # scatter_add_函数：在指定维度上，将源张量中指定索引位置的元素加到目标张量中，并返回目标张量
+                # 输入格式(假设目标张量为aim): aim.scatter_add_(dim:沿着哪个维度进行操作, index:指定索引位置, src:源张量)
+                # 在现在的ce中，元素大于1则表示该专家被选中的次数大于期望次数，过载；反之则小于期望次数，欠载(工作不到位)
+
+                # ce是每一个batch中每个专家的相对出勤频率
+                aux_loss = (ce * scores_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
+                # scores_seq_aux.mean(dim=1): dim=1的维度是seq_len，这个计算得到的是每个序列所使用的专家的平均得分(每个token的专家选择概率)，反映了每个专家的平均能力大小
+                # (ce * scores_seq_aux.mean(dim=1)): 每个专家的相对出勤频率 * 每个专家的平均得分
+                # .sum(dim=1).mean(): 沿着dim=1的维度进行求和，然后求平均，得到每个样本（batch）所有token的平均得分
+                # 辅助损失 = 每个样本（batch）所有token的平均得分 * 每个token的平均得分 * 超参数alpha
+            else:
+                mask_ce = F.one_hot(topk_index_aux_loss.view(-1), num_classes=self.n_routed_experts)
+                # 将topk_index_aux_loss展平为1D张量（形状：[batch_size * seq_len * top_k]）
+                # 生成one-hot编码矩阵（形状：[总token数*top_k, 专家数]），标记每个token选择的专家
+                ce = mask_ce.float().mean(dim=0) # 计算每个专家的相对出勤频率
+                pi = scores_aux.mean(dim=0) # 计算每个专家的平均得分
+                fi = ce * self.n_routed_experts # 实际比例因子=每个专家的相对出勤频率 * 专家总数，表示实际选择次数与期望次数的比值（期望次数 = 总选择次数 / 专家总数） 
+                aux_loss = (pi * fi).sum() * self.alpha 
+                # 辅助损失 = sum(每个专家的平均得分 * 实际比例因子) * 超参数alpha
+                # 鼓励得分高的专家（pi大）保持合理的使用频率（fi接近1）；惩罚某些专家长期被冷落或过度使用的现象
+        else:
+            aux_loss = 0
+
+        return topk_index, topk_scores, aux_loss
+
+
         
 
-                
+        
+        
+
