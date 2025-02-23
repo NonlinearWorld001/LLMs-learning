@@ -262,11 +262,12 @@ class  MOEGate(nn.Module):
             denominator = topk_scores.sum(dim=-1, keepdim=True) + 1e-20 # 计算归一化所用的分母，+1e-20是为了防止分母为0
             topk_scores = topk_scores / denominator # 归一化
 
-        if self.training and self.alpha > 0: # 如果处于训练模式，并且alpha大于0，则计算辅助损失：最终目的是防止"专家僵死"问题，提升所有专家的利用率，增强模型容量
+        # 如果处于训练模式，并且alpha大于0，则计算辅助损失：最终目的是防止"专家僵死"问题，提升所有专家的利用率，增强模型容量
+        if self.training and self.alpha > 0: 
             scores_aux = scores # 辅助损失的所有专家的得分，形状为[batch_size * seq_len, n_routed_experts]
             aux_topk = self.top_k # 辅助损失的专家数量
             topk_index_aux_loss = topk_index.view(batch_size, -1) # 把辅助损失的专家索引按照batch分好，[batch_size * seq_len, top_k] --> [batch_size, seq_len * top_k]
-            if self.seq_aux: # 如果需要计算序列级别的辅助损失
+            if self.seq_aux: # 如果需要计算序列级别的辅助损失，考虑序列长度的影响，需要对序列归一化，更适合处理存在不同序列长度的NLP任务
                 scores_seq_aux = scores_aux.view(batch_size, seq_len, -1) # 再把辅助损失的得分按照batch和seq_len分好，[batch_size * seq_len, n_routed_experts] --> [batch_size, seq_len, n_routed_experts]
                 ce = torch.zeros(batch_size, self.n_routed_experts, device=hidden_states.device)# 创建一个形状为[batch_size, n_routed_experts]的计数张量ce，用于存储每个专家的计数
                 
@@ -282,13 +283,26 @@ class  MOEGate(nn.Module):
                 # 输入格式(假设目标张量为aim): aim.scatter_add_(dim:沿着哪个维度进行操作, index:指定索引位置, src:源张量)
                 # 在现在的ce中，元素大于1则表示该专家被选中的次数大于期望次数，过载；反之则小于期望次数，欠载(工作不到位)
 
+                # 改进型aux_loss算法放的位置，放入改进型算法后，应把289行代码注释掉
+
                 # ce是每一个batch中每个专家的相对出勤频率
                 aux_loss = (ce * scores_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
                 # scores_seq_aux.mean(dim=1): dim=1的维度是seq_len，这个计算得到的是每个序列所使用的专家的平均得分(每个token的专家选择概率)，反映了每个专家的平均能力大小
                 # (ce * scores_seq_aux.mean(dim=1)): 每个专家的相对出勤频率 * 每个专家的平均得分
                 # .sum(dim=1).mean(): 沿着dim=1的维度进行求和，然后求平均，得到每个样本（batch）所有token的平均得分
                 # 辅助损失 = 每个样本（batch）所有token的平均得分 * 每个token的平均得分 * 超参数alpha
-            else:
+                '''
+                以上辅助损失可能会出现所有专家都被冷落的情况, 即所有专家的相对出勤频率都为0, 此时辅助损失为0, 模型无法学习到专家的分布, 从而导致模型性能下降
+                因此，可改进为：
+                1.交叉熵计算损失(不一定好):
+                               target_freq = torch.ones(n_routed_experts) / n_routed_experts  # 目标频率：均匀分布
+                               aux_loss = F.cross_entropy(ce, target_freq) * alpha
+                2.改进型aux_loss算法:
+                               eps = 1e-8  # 避免数值不稳定
+                               aux_loss = -torch.log(ce + eps).mean() * alpha
+                '''
+
+            else:# 如果不需要计算序列级别的辅助损失，则直接计算token级别的辅助损失
                 mask_ce = F.one_hot(topk_index_aux_loss.view(-1), num_classes=self.n_routed_experts)
                 # 将topk_index_aux_loss展平为1D张量（形状：[batch_size * seq_len * top_k]）
                 # 生成one-hot编码矩阵（形状：[总token数*top_k, 专家数]），标记每个token选择的专家
