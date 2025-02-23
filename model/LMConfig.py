@@ -6,7 +6,7 @@ class LMConfig(PretrainedConfig):
 
     def __init__(
             self,  
-            dim: int=512,                  # 门控层的维度，决定了门控层的输出维度
+            dim: int=512,                  # 门控层的维度，决定了门控层的输入维度==token特征维度
             n_layers: int=8,               # transformer的层数 ？
             n_heads: int=16,               # 总注意力头数（查询头数量），决定query向量的并行计算能力
             n_kv_heads: int=8,             # 键/值头的数量，决定key/value向量的复用程度
