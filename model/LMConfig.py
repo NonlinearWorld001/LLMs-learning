@@ -6,7 +6,7 @@ class LMConfig(PretrainedConfig):
 
     def __init__(
             self,  
-            dim: int=512,                  # 每个token的特征维度
+            dim: int=512,                  # 门控层的维度，决定了门控层的输出维度
             n_layers: int=8,               # transformer的层数 ？
             n_heads: int=16,               # 总注意力头数（查询头数量），决定query向量的并行计算能力
             n_kv_heads: int=8,             # 键/值头的数量，决定key/value向量的复用程度
@@ -25,7 +25,7 @@ class LMConfig(PretrainedConfig):
             scoring_func='softmax',        # 评分函数，默认为'softmax'
             aux_loss_alpha=0.01,           # 辅助损失的alpha参数
             seq_aux=True,                  # 是否在序列级别上计算辅助损失
-            norm_topk_prob=True,           # 是否标准化top-k概率
+            norm_topk_prob=True,           # 是否标准化num_experts_per_token概率
             **kwargs,                      
     ):
         self.dim = dim
