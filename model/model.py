@@ -202,11 +202,11 @@ class FeedForward(nn.Module):
         FeedForward 网络结构示意：
                       输入
                         ├─ w1 → Silu激活 ─┐
-                        │                │ 逐元素相乘 → w2 → Dropout → 输出
+                        │                │—逐元素相乘 → w2 → Dropout → 输出
                         └─ w3 → 门控系数 ─┘
     '''
     def forward(self, x:torch.Tensor):
-        return self.dropout( # 4. 最终输出正则化
+        return self.dropout( # 4. 随机失活层
             self.w2( # 3. 降维到原始维度
                 F.silu(self.w1(x)) # 1. 升维+SwiGLU激活
                  * self.w3(x) # 2. 并行门控机制
@@ -316,6 +316,34 @@ class  MOEGate(nn.Module):
             aux_loss = 0
 
         return topk_index, topk_scores, aux_loss
+
+
+# 混合专家前馈神经网络层(类)：1.创建n_routed_experts个专家；2.根据每个token的专家选择概率，选择对应的专家进行处理；3.如果n_shared_experts不为None，则创建一个共享专家
+class MOEFeedForward(nn.Module):
+    def __init__(self, config:LMConfig):
+        super().__init__()
+        self.config = config
+        self.experts = nn.ModuleList([
+            FeedForward(
+                dim = config.dim, # 输入特征的维度
+                hidden_dim = config.hidden_dim, # 隐藏层维度
+                multiple_of = config.multiple_of, # 隐藏层维度的倍数
+                drop_out = config.dropout, # 随机失活层的概率
+            )
+            for _ in range(config.n_routed_experts) # 生成n_routed_experts个(独立)专家
+        ])
+
+        self.gate = MOEGate(config) # 混合专家门控机制
+        if config.n_shared_experts is not None:
+            self.shared_experts = FeedForward(
+                dim = config.dim, # 输入特征的维度
+                hidden_dim = config.hidden_dim, # 隐藏层维度
+                multiple_of = config.multiple_of, # 隐藏层维度的倍数
+                drop_out=config.dropout, # 随机失活层的概率
+            ) # 创建一个共享专家
+
+        
+        
 
 
         
