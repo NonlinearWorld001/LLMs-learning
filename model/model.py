@@ -215,7 +215,7 @@ class FeedForward(nn.Module):
 
 
 # 混合专家门控机制层(类)
-class  MOEGate(nn.Module):
+class MOEGate(nn.Module):
     def __init__(self, config:LMConfig):
         super().__init__()
         self.config = config # 配置参数
@@ -341,6 +341,39 @@ class MOEFeedForward(nn.Module):
                 multiple_of = config.multiple_of, # 隐藏层维度的倍数
                 drop_out=config.dropout, # 随机失活层的概率
             ) # 创建一个共享专家
+
+    def forward(self, x:torch.Tensor):
+        identity = x                       # 输入
+        origin_shape = x.shape             # 输入的形状, [batch_size, seq_len, hidden_dim]
+        batch_size, seq_len, _ = x.shape   # 获取输入的batch_size和seq_len
+
+        # 门控机制
+        topk_index, topk_scores, aux_loss = self.gate(x)
+        x = x.view(-1, x.shape[-1]) # 展平, [batch_size, seq_len, hidden_dim] --> [batch_size * seq_len, hidden_dim]
+        flat_topk_index = topk_index.view(-1) # 合并所有的batch和seq_len,[batch_size * seq_len, top_k] --> [batch_size * seq_len * top_k]
+
+        if self.training:
+            # 训练模式
+            x = x.repeat_interleave(self.config.num_experts_per_token, dim=0)
+            # 输入样本都被重复预设好的处理每个token需要的专家数量， 【batch_size * seq_len, hidden_dim] --> [batch_size * seq_len * top_k, hidden_dim]
+            y = torch.empty_like(x, dtype=torch.float16) # 用于储存专家处理后的结果，所以和x的形状相同
+            for i, expert in enumerate(self.experts):
+                y[flat_topk_index == i] = expert(x[flat_topk_index == i])
+                y = (y.view(*topk_scores.shape, -1) * topk_scores.unsqueeze(-1)).sum(dim=1)
+                # topk_scores.shape = [batch_size * seq_len, top_k]
+                # y.view(*topk_scores.shape, -1).shape = [batch_size * seq_len, top_k, hidden_dim]
+                # topk_scores.unsqueeze(-1).shape = [batch_size * seq_len, top_k, 1]
+                # 将每个token路由到的指定个数的专家输出，按其对应的门控权重进行加权融合，最终形成每个token的最终特征表示。
+        else:
+            # 推理模式, 只选择最优专家
+            y = self.moe_infer(x, flat_topk_index, topk_scores.view(-1, 1)).view(*origin_shape) 
+            # 在推理模式下，调用 self.moe_infer 函数
+
+            if self.config.n_shared_experts is not None: # 检查是否定义了共享专家
+                y = y + self.shared_experts(identity) # 如果有共享专家，将共享专家处理原始输入 identity 的结果加到 y 上
+
+            return y
+        
 
         
         
