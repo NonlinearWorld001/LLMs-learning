@@ -373,6 +373,10 @@ class MOEFeedForward(nn.Module):
                 y = y + self.shared_experts(identity) # 如果有共享专家，将共享专家处理原始输入 identity 的结果加到 y 上
 
             return y
+
+        @torch.no_grad() # 装饰器，用于告诉PyTorch，这个函数在推理过程中不需要计算梯度
+        def moe_infer(self, x, flat_expert_indices, flat_expert_scores):
+            pass
         
 
         
