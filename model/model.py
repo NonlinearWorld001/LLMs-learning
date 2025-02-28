@@ -363,7 +363,7 @@ class MOEFeedForward(nn.Module):
                 # topk_scores.shape = [batch_size * seq_len, top_k]
                 # y.view(*topk_scores.shape, -1).shape = [batch_size * seq_len, top_k, hidden_dim]
                 # topk_scores.unsqueeze(-1).shape = [batch_size * seq_len, top_k, 1]
-                # 将每个token路由到的指定个数的专家输出，按其对应的门控权重进行加权融合，最终形成每个token的最终特征表示。
+                # 将每个token路由到的指定个数的专家输出，按其对应的门控权重进行加权融合，最终形成每个token的最终特征表示
         else:
             # 推理模式, 只选择最优专家
             y = self.moe_infer(x, flat_topk_index, topk_scores.view(-1, 1)).view(*origin_shape) 
@@ -374,9 +374,48 @@ class MOEFeedForward(nn.Module):
 
             return y
 
-        @torch.no_grad() # 装饰器，用于告诉PyTorch，这个函数在推理过程中不需要计算梯度
+        @torch.no_grad() # 装饰器，用于告诉PyTorch，这个函数在推理过程中不需要计算梯度 <-- 仅在推理过程中使用
         def moe_infer(self, x, flat_expert_indices, flat_expert_scores):
-            pass
+            '''
+            x: 输入张量，形状为 [batch_size * seq_len, hidden_dim]
+            flat_expert_indices: 展平的专家索引，形状为 [batch_size * seq_len * top_k]
+            flat_expert_scores: 展平的专家得分，形状为 [batch_size * seq_len * top_k]
+            '''
+            expert_cache = torch.zeros_like(x) # 初始化专家缓存：创建一个与x形状相同的全0张量，用于存储专家处理后的结果
+            index = flat_expert_indices.argsort() # 对flat_expert_indices排序，获取专家索引的排序索引，这样可以将分配给同一个专家的 token 聚集在一起：
+                                                  #每num_experts_per_tok个元素表示第len(index)//num_experts_per_tok个专家处理的num_experts_per_tok个token在flat_expert_indices中的位置
+            tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0) # 统计每个专家被分配的token数量，并且分别计算累计和
+            # .bincount(): 统计每个专家被分配的token数量
+            # .cpu().numpy(): 将结果转换为numpy数组
+            # .cumsum(0): 计算每个专家被分配的token数量的累积和 ## 累积和可以用于快速定位每个专家处理的token范围，比如说在分布式计算中分配任务
+            # 例如：tokens_per_expert = [2, 4, 6, 8, 10]，表示第0个专家处理0~2个token，第1个专家处理2~6个token，第2个专家处理6~12个token，第3个专家处理12~20个token，第4个专家处理20~30个token
+            token_index = index // self.config.num_experts_per_token #将排序后的专家索引位置映射回原始token位置
+            '''
+            flat_expert_indices = [3,1, 0,2, 2,3, 1,0, 3,2],batch_size=1,seq_len=5,top_k=2
+            假设num_experts_per_token=2,排序后的专家索引为[2,7, 1,6, 3,4,9, 0,5,8]
+            则token_index = index // 2 → [1,3, 0,3, 1,2,4, 0,2,4]
+            表示：
+            - 0号专家处理token1和token3
+            - 1号专家处理token0和token3
+            - 2号专家处理token1、token2和token4
+            - 3号专家处理token0、token2和token4
+            '''
+            for i, end_index in enumerate(tokens_per_expert):
+                # i: 当前专家的索引 ; end_index: 当前专家处理的token的尾索引
+                start_index = 0 if i ==0 else tokens_per_expert[i-1] # 确定当前专家处理的token范围，tokens_per_expert[i-1]：前一个专家处理的token的尾索引
+                if start_index == end_index:
+                    continue # 如果当前专家没有处理任何token，则跳过
+                expert = self.experts[i] # 获取当前专家
+                exp_token_index = token_index[start_index:end_index] # 获取当前专家处理的token索引，返回的是一个"列表"
+                expert_tokens = x[exp_token_index] # 获取当前专家处理的tokens
+                expert_out = expert(expert_tokens) # 安排专家来处理token
+                expert_out.mul_(flat_expert_scores[index[start_index:end_index]]) # 将专家处理后的结果乘以对应的专家得分
+                expert_cache.scatter_add_(0, exp_token_index.view(-1,1).repeat(1,x.shape[-1]),expert_out)
+                # 将专家处理后的结果存储到专家缓存中
+            return expert_cache
+
+                
+
         
 
         
