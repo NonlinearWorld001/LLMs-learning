@@ -415,6 +415,19 @@ class MOEFeedForward(nn.Module):
                 # 将专家处理后的结果存储到专家缓存中
             return expert_cache
 
+# 一个Transformer块(类)：1.创建一个注意力机制；2.创建一个混合专家前馈神经网络层；3.创建一个残差连接和层归一化
+class TransformerBlock(nn.Module):
+    def __init__(self, layer_id:int, config:LMConfig):
+        super().__init__()
+        self.n_heads = config.n_heads # 注意力头数==查询头数
+        self.dim = config.dim
+        self.head_dim = config.dim // config.n_heads
+        self.attention = Attention(config)
+
+
+
+    def forward(self, x:torch.Tensor):
+        
                 
 
         
