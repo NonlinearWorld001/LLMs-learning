@@ -420,9 +420,9 @@ class TransformerBlock(nn.Module):
     def __init__(self, layer_id:int, config:LMConfig):
         super().__init__()
         self.n_heads = config.n_heads # 注意力头数==查询头数
-        self.dim = config.dim
-        self.head_dim = config.dim // config.n_heads
-        self.attention = Attention(config)
+        self.dim = config.dim # 特征维度
+        self.head_dim = config.dim // config.n_heads # 注意力头数的平均维度
+        self.attention = Attention(config) # 1.实例化之前定义的注意力机制模块
 
 
 
