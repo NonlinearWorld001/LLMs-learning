@@ -176,7 +176,7 @@ class Attention(nn.Module):
         output = self.resid_dropout(output) # 应用残差连接的随机失活层
         return output
             
-# 前馈神经网络层(类)：SwiGLU（Swish-Gated Linear Unit）前馈网络结构
+# 前馈神经网络层(类)：SwiGLU（Swish-Gated Linear Unit）前馈网络结构，实现门控机制
 class FeedForward(nn.Module):
     def __init__(self, dim:int, hidden_dim:int=None, multiple_of:int=128, drop_out:float=0.0):
         '''
@@ -415,7 +415,7 @@ class MOEFeedForward(nn.Module):
                 # 将专家处理后的结果存储到专家缓存中
             return expert_cache
 
-# 一个Transformer块(类)：1.创建一个注意力机制；2.创建一个混合专家前馈神经网络层；3.创建一个残差连接和层归一化
+# 一个Transformer块(类)
 class TransformerBlock(nn.Module):
     def __init__(self, layer_id:int, config:LMConfig):
         super().__init__()
@@ -425,12 +425,36 @@ class TransformerBlock(nn.Module):
         self.attention = Attention(config) # 创建一个注意力机制
 
         self.layer_ID =  layer_id # 当前层ID
-        self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps) # 归一化层
+        self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps) # 注意力归一化层，并设定稳定性参数
+        self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps) # 前馈神经网络归一化层，并设定稳定性参数
+        
+        if config.use_moe:
+            self.feed_forward = MOEFeedForward(config) # 若使用混合专家前馈神经网络层，则实例化之前定义的混合专家前馈神经网络层
+        else:
+            self.feed_forward = FeedForward(
+                dim=config.dim,
+                hidden_dim=config.hidden_dim,
+                multiple_of=config.multiple_of,
+                drop_out=config.dropout,
+            ) # 若不使用混合专家前馈神经网络层，则实例化之前定义的FeedForward类
 
+    # 前向传播函数
+    def forward(self, x:torch.Tensor, pos_cis:torch.Tensor, kv_cache=False):
+        '''
+        x: 输入张量，形状为 [batch_size, seq_len, hidden_dim]
+        pos_cis: 位置编码，形状为 [batch_size, seq_len, hidden_dim]
+        kv_cache: 是否使用缓存
+        '''     
+        h = x + self.attention(self.attention_norm(x), pos_cis, kv_cache) # 注意力机制，嵌入位置编码进行注意力计算，并加上x进行残差连接以缓解梯度消失问题
+        h = h + self.feed_forward(self.ffn_norm(h)) # 前馈神经网络，对h进行归一化后进行门控机制的实现，并同样加上h进行残差连接以缓解梯度消失问题
+        return h
+    
 
+# 完整的Transformer模型(类)，把之前定义的所有类组合起来，是实现整个LLM的框架以及框架的填充
+class Transformer(PreTrainedModel):
+    config_class = LMConfig # 根据LMConfig配置类
+    last_loss: Optional[torch.Tensor] # 储存最后一次损失，Optional[torch.Tensor]表示这个属性可能没有值（即为 None），例如在模型初始化时或尚未计算损失时
 
-    def forward(self, x:torch.Tensor):
-        pass
                 
 
         
