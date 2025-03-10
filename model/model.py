@@ -420,14 +420,17 @@ class TransformerBlock(nn.Module):
     def __init__(self, layer_id:int, config:LMConfig):
         super().__init__()
         self.n_heads = config.n_heads # 注意力头数==查询头数
-        self.dim = config.dim
-        self.head_dim = config.dim // config.n_heads
-        self.attention = Attention(config)
+        self.dim = config.dim # 输入特征的维度
+        self.head_dim = config.dim // config.n_heads # 每个注意力头的维度
+        self.attention = Attention(config) # 创建一个注意力机制
+
+        self.layer_ID =  layer_id # 当前层ID
+        self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps) # 归一化层
 
 
 
     def forward(self, x:torch.Tensor):
-        
+        pass
                 
 
         
