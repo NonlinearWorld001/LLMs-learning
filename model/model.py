@@ -424,7 +424,7 @@ class TransformerBlock(nn.Module):
         self.head_dim = config.dim // config.n_heads # 每个注意力头的维度
         self.attention = Attention(config) # 创建一个注意力机制
 
-        self.layer_ID =  layer_id # 当前层ID
+        self.layer_ID =  layer_id # 当前层在transformer中的ID
         self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps) # 注意力归一化层，并设定稳定性参数
         self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps) # 前馈神经网络归一化层，并设定稳定性参数
         
@@ -452,14 +452,49 @@ class TransformerBlock(nn.Module):
 
 # 完整的Transformer模型(类)，把之前定义的所有类组合起来，是实现整个LLM的框架以及框架的填充
 class Transformer(PreTrainedModel):
-    config_class = LMConfig # 根据LMConfig配置类
+    config_class = LMConfig # 根据LMConfig类配置transformer类
     last_loss: Optional[torch.Tensor] # 储存最后一次损失，Optional[torch.Tensor]表示这个属性可能没有值（即为 None），例如在模型初始化时或尚未计算损失时
 
-                
-
+    def __init__(self, params:LMConfig | None = None):
+        self.params = params or LMConfig() # 如果params为None，则使用LMConfig的默认参数
+        super().__init__(self.params)
+        self.vocab_size = self.params.vocab_size # 词汇表大小
+        self.n_layers = self.params.n_layers # transformer的transformer block层(个)数
         
+        self.token_embedding = nn.Embedding(self.vocab_size, self.params.dim) # 创建一个词汇表大小的嵌入层，用于将token转换为特征向量
+        self.layers = nn.ModuleList() # 创建一个模块列表，用于存储所有TransformerBlock
+        self.dropout = nn.Dropout(self.params.dropout) # 创建随机失活层，用于防止过拟合
+        '''在self.layers中添加指定个数的TransformerBlock，并由pytorch自动管理，这就是整个基于transformer的LLM的网络结构'''
+        for trans_block_id in range(self.n_layers):
+            self.layers.append(TransformerBlock(layer_id=trans_block_id, config=self.params))
+        self.norm = RMSNorm(self.params.dim, eps=self.params.norm_eps) # 创建一个归一化层，用于将特征向量归一化
+        self.output = nn.Linear(self.params.dim, self.vocab_size, bias=False) # 创建一个线性层，用于将特征向量转换为词汇表大小的概率分布,输入特征维度=预定的token维度，输出特征维度=词汇表大小
+        self.token_embedding.weight = self.output.weight # 将token_embedding的权重与output的权重共享，在减少参数量的同时，保持token_embedding和output的语义空间一致
+        pos_cis = precompute_pos_cis(self.params.dim // self.params.n_heads, self.params.max_seq_length) # 预计算位置编码
+        self.register_buffer('pos_cis', pos_cis, persistent=False) # 将预计算的位置编码注册为模型的缓存(不可学习的参数)，缓存不会参与梯度更新
 
+        self.apply(self._init_weights) # 使用_init_weights函数初始化模型参数; apply()函数会遍历模型的所有子模块，并调用_init_weights函数初始化每个子模块的参数
+
+        for pn, p in self.named_parameters(): # 遍历模型中的所有参数, named_parameters()返回一个生成器，生成器中的每个元素是一个包含参数名称和参数值的元组
+            if pn.endswith('w3.weight') or pn.endswith('wo.weight'): # 如果参数名称以'w3.weight'或'wo.weight'结尾
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * self.params.n_layers)) 
+                # 使用正态分布初始化参数，均值为0，标准差为0.02除以sqrt(2 * n_layers), 通过缩小深层网络特定层权重的初始化标准差，平衡网络深度带来的梯度衰减/爆炸问题
+                # 在训练深层Transformer类模型时，这种初始化策略能提升收敛速度和稳定性
+                # 式子中的0.02和2都是经验值，也是需要根据实际情况进行调整的超参数
+        self.loss = None # 初始化损失为None
+        self.OUT = CausalLMOutputWithPast # 初始化输出为CausalLMOutputWithPast
+        '''
+        CausalLMOutputWithPast: 一种因果语言模型输出，包含预测的下一个token概率分布和损失
+        '''
+        self.np_split_modules = [name for name, _ in self.named_modules()]
+        # 获取所有模块的名称，并存储在self.np_split_modules列表中
+        # named_modules()返回一个生成器，生成器中的每个元素是一个包含模块名称和模块本身的元组, 会定位到之前已经被注册为子模块的self.layers上，利用里面存储/标记的transformer block的名称生成可迭代对象
+        # 例如，如果一个模块的名称是"module.layer.0.feed_forward.w3.weight"，那么它将被存储在self.np_split_modules列表中
+        # 这个列表用于存储所有需要进行参数分割的模块名称
         
+        #定义权重矩阵初始化函数
+        def _init_weights(self, module):
+            pass
         
 
 

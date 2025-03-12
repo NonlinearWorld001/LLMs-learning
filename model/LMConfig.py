@@ -7,7 +7,7 @@ class LMConfig(PretrainedConfig):
     def __init__(
             self,  
             dim: int=512,                  # 门控层的维度，决定了门控层的输入维度==token特征维度
-            n_layers: int=8,               # transformer的层数 ？
+            n_layers: int=8,               # transformer的层数--transformer由若干个transformer block组成，这个参数决定了我们的transformer有多少个transformer block
             n_heads: int=16,               # 总注意力头数（查询头数量），决定query向量的并行计算能力
             n_kv_heads: int=8,             # 键/值头的数量，决定key/value向量的复用程度
             # 每个key/value头会被多个query头共享（本例中16/8=2个query头共享1个key/value头，这个比例和标准transformer相比降低了50%参数量）
