@@ -468,12 +468,13 @@ class Transformer(PreTrainedModel):
         for trans_block_id in range(self.n_layers):
             self.layers.append(TransformerBlock(layer_id=trans_block_id, config=self.params))
         self.norm = RMSNorm(self.params.dim, eps=self.params.norm_eps) # 创建一个归一化层，用于将特征向量归一化
-        self.output = nn.Linear(self.params.dim, self.vocab_size, bias=False) # 创建一个线性层，用于将特征向量转换为词汇表大小的概率分布,输入特征维度=预定的token维度，输出特征维度=词汇表大小
+        self.output = nn.Linear(self.params.dim, self.vocab_size, bias=False) # 创建一个线性层，用于将特征向量转换为词汇表大小的概率分布,输入特征维度=预定的token维度，输出特征维度=词汇表大小,输出形状为[batch_size, seq_len, vocab_size]
         self.token_embedding.weight = self.output.weight # 将token_embedding的权重与output的权重共享，在减少参数量的同时，保持token_embedding和output的语义空间一致
         pos_cis = precompute_pos_cis(self.params.dim // self.params.n_heads, self.params.max_seq_length) # 预计算位置编码
         self.register_buffer('pos_cis', pos_cis, persistent=False) # 将预计算的位置编码注册为模型的缓存(不可学习的参数)，缓存不会参与梯度更新
 
         self.apply(self._init_weights) # 使用_init_weights函数初始化模型参数; apply()函数会遍历模型的所有子模块，并调用_init_weights函数初始化每个子模块的参数
+        '''(torch.nn.apply(fn)是深度优先搜索)'''
 
         for pn, p in self.named_parameters(): # 遍历模型中的所有参数, named_parameters()返回一个生成器，生成器中的每个元素是一个包含参数名称和参数值的元组
             if pn.endswith('w3.weight') or pn.endswith('wo.weight'): # 如果参数名称以'w3.weight'或'wo.weight'结尾
@@ -492,9 +493,61 @@ class Transformer(PreTrainedModel):
         # 例如，如果一个模块的名称是"module.layer.0.feed_forward.w3.weight"，那么它将被存储在self.np_split_modules列表中
         # 这个列表用于存储所有需要进行参数分割的模块名称
         
-        #定义权重矩阵初始化函数
-        def _init_weights(self, module):
-            pass
+    #定义权重矩阵初始化函数
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02) # 使用正态分布初始化权重矩阵module.weight，均值为0，标准差为0.02
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias) # 如果模块有偏置，则将其初始化为0
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02) # 和Linear层一样使用正态分布初始化权重矩阵module.weight，均值为0，标准差为0.02，但是词嵌入层不包括偏置，所以要分开初始化
+
+    # 基于transformer的LLM的前向传播函数
+    def forward(self, tokens:Optional[torch.Tensor] = None, targets:Optional[torch.Tensor] = None, kv_cache=False, **keyargs):
+        '''
+            tokens: 输入的token序列，形状为[batch_size, seq_len], 类型只能为torch.Tensor或者None
+            targets: 目标token序列，形状为[batch_size, seq_len], 类型只能为torch.Tensor或者None
+            kv_cache: 是否使用缓存
+            **keyargs: 其他参数
+        '''
+        current_idx = 0 # 当前token的索引
+        if 'input_ids' in keyargs:
+            tokens = keyargs['input_ids'] # 允许用户通过input_ids来指定输入的token序列，这表明既允许传入tokens，也允许传入input_ids作为处理对象tokens
+        if 'attention_mask' in keyargs:
+            targets = keyargs['attention_mask'] # 允许用户通过attention_mask来指定哪些位置是填充的，允许指定其他来源的attention_mask
+        if 'current_idx' in keyargs:
+            current_idx = int(keyargs['current_idx']) #允许外部传入 current_idx 以控制处理位置：在生成任务中，逐步生成 token 时，通过 current_idx 指定当前生成的位置（避免重复处理已生成部分）
+                                                                                        # 例如：第一次调用时 current_idx=0，生成一个 token 后，下一次调用 current_idx=1，依此类推
+        
+        _bsz, seqlen = tokens.shape # 获取输入的batch_size和seq_len
+
+        h = self.token_embedding(tokens) # 将tokens转换为特征向量
+        h = self.dropout(h) # 使用dropout层进行随机失活,实现正则化嵌入，防止过拟合低频词或特定样本，可以增加模型的鲁棒性和泛化能力，注意仅在训练阶段开启，推理时使用完整的词嵌入；在训练不稳定的时候可以调整失活率
+        pos_cis = self.pos_cis[current_idx:current_idx+seqlen] # 获取从当前位置到当前位置+seq_len的位置编码（在473、474行预计算位置编码时，已经将位置编码缓存到self.pos_cis中，作为模型参数的一部分，可以随时被访问）
+        for idx, layer in enumerate(self.layers):
+            h = layer(h, pos_cis, kv_cache) # 将h和pos_cis传入transformer blocks中，在每一个transformer block中依次进行前向传播
+        
+        h = self.norm(h) # 对h进行归一化
+
+        if targets is not None:
+            logits = self.output(h) # 在targets不为None时（即存在掩码时），计算logits（一般是最后一层的原始输出，通常会被传递给激活函数计算概率分布，也会被传递给损失函数计算损失）
+            self.last_loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                                                               ignore_index=0, reduction='none') 
+            # 计算交叉熵损失
+            # logits.view(-1, logits.shape[-1])：将logits展平为[batch_size * seq_len, vocab_size]
+            # targets.view(-1)：将targets展平为[batch_size * seq_len]
+            # ignore_index=0表示忽略索引为0的token（通常是填充token：填充token是指在序列中添加的用于保持序列长度一致的token，通常用0表示），reduction='none'表示不进行平均，返回每个样本的损失
+        else:
+            logits = self.output(h[:, [-1], :]) # 在targets为None时（即不存在掩码时），计算logits, [:, [-1], :]表示取最后一个token的特征向量，仅用最后一个token的特征向量来计算logits（下一个token的预测）
+            self.last_loss = None # 在targets为None时，不计算损失
+
+
+
+
+
+
+
+            
         
 
 
