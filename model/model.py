@@ -540,19 +540,7 @@ class Transformer(PreTrainedModel):
         else:
             logits = self.output(h[:, [-1], :]) # 在targets为None时（即不存在掩码时），计算logits, [:, [-1], :]表示取最后一个token的特征向量，仅用最后一个token的特征向量来计算logits（下一个token的预测）
             self.last_loss = None # 在targets为None时，不计算损失
-
-
-
-
-
-
-
-            
         
+        return self.OUT(logits=logits, loss=self.last_loss)
 
-
-        
-
-        
-        
 
