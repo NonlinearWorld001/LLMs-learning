@@ -508,7 +508,7 @@ class Transformer(PreTrainedModel):
             tokens: 输入的token序列，形状为[batch_size, seq_len], 类型只能为torch.Tensor或者None
             targets: 目标token序列，形状为[batch_size, seq_len], 类型只能为torch.Tensor或者None
             kv_cache: 是否使用缓存
-            **keyargs: 其他参数
+            **keyargs: 其他参数，应当是一个字典
         '''
         current_idx = 0 # 当前token的索引
         if 'input_ids' in keyargs:
@@ -541,6 +541,36 @@ class Transformer(PreTrainedModel):
             logits = self.output(h[:, [-1], :]) # 在targets为None时（即不存在掩码时），计算logits, [:, [-1], :]表示取最后一个token的特征向量，仅用最后一个token的特征向量来计算logits（下一个token的预测）
             self.last_loss = None # 在targets为None时，不计算损失
         
+        self.OUT.__setitem__('logits', logits) # 将logits存储到OUT中
+        self.OUT.__setitem__('loss', self.last_loss) # 将loss存储到OUT中
+
         return self.OUT(logits=logits, loss=self.last_loss)
+    
+    @torch.inference_mode() # 装饰器，用于告诉PyTorch，这个函数在推理生成过程中不需要计算梯度
+    def generate(self, idx, eos, max_new_tokens, temperature=0.7, top_k=8, stream=True, rp=1, kv_cache=True):
+        '''
+        idx: 初始输入的token序列，形状为[batch_size, seq_len]
+        eos: 结束token的索引
+        max_new_tokens: 最大生成token数
+        temperature: 温度参数，用于控制生成结果的多样性
+        top_k: 用于控制生成结果的多样性
+        stream: 是否流式生成
+        rp: 重复惩罚因子
+        kv_cache: 是否使用缓存
+        '''
+        index = idx.shape[1] # 初始化位置索引，即当前输入的token序列的长度
+        init_inference = True # 初始化推理标志,用于判断是否是第一次推理
+        while idx.shape[1] < max_new_tokens-1: # 如果当前输入的token序列的长度小于最大生成token数，则继续生成
+            if init_inference or not kv_cache:
+                inference_res, init_inference = self(idx, kv_cache=kv_cache), False 
+                # 如果当前是第一次推理或者禁用缓存的时候，则进行推理时处理整个序列
+            else:
+                inference_res = self(idx[:, -1:], kv_cache=kv_cache, current_idx=idx[1]-1)
+                # 后续推理or启用缓存的时候，则进行推理时处理最后一个token
+
+        
+
+    
+
 
 
