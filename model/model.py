@@ -547,9 +547,9 @@ class Transformer(PreTrainedModel):
         return self.OUT(logits=logits, loss=self.last_loss)
     
     @torch.inference_mode() # 装饰器，用于告诉PyTorch，这个函数在推理生成过程中不需要计算梯度
-    def generate(self, idx, eos, max_new_tokens, temperature=0.7, top_k=8, stream=True, rp=1, kv_cache=True):
+    def generate(self, idx, eos, max_new_tokens, temperature=0.7, top_k=8, stream=True, rp=1.1, kv_cache=True):
         '''
-        idx: 初始输入的token序列，形状为[batch_size, seq_len]
+        idx: 初始输入的token序列，形状为[batch_size=1, seq_len]
         eos: 结束token的索引
         max_new_tokens: 最大生成token数
         temperature: 温度参数，用于控制生成结果的多样性
@@ -565,12 +565,52 @@ class Transformer(PreTrainedModel):
                 inference_res, init_inference = self(idx, kv_cache=kv_cache), False 
                 # 如果当前是第一次推理或者禁用缓存的时候，则进行推理时处理整个序列
             else:
-                inference_res = self(idx[:, -1:], kv_cache=kv_cache, current_idx=idx[1]-1)
+                inference_res = self(idx[:, -1:], kv_cache=kv_cache, current_idx=idx.shape[1]-1)
                 # 后续推理or启用缓存的时候，则进行推理时处理最后一个token
+            # inference_res: 推理结果，包含logits和loss; logits: 形状为[batch_size, vocab_size]
+            logits = inference_res.logits[:, -1, :] 
+            # 获取最后一个token的logits, 当前形状为[batch_size, vocab_size]，第二维的每个元素是没有经过softmax函数计算得到的原始输出
 
+            for token in set(idx.tolist()[0]):# 在推理时只会输入一个序列，等同于只有一个batch，所以只用idx.tolist()[0]对第一个bacth进行处理即可
+                logits[:, token] /= rp 
+                # 应用重复惩罚因子，用于惩罚重复的token，避免模型生成重复的token
+                # 原理是：如果一个token在之前的序列中出现过，那么在用于生成当前token的logits中，该token的logits值除以一个大于1的数，
+                # 这样整个logits在后续利用softmax计算概率分布时，该token的概率会降低，同时提高其他token的概率，从而避免模型生成重复的token
+            
+            if temperature == 0.0:
+                _, idx_next = torch.topk(logits, top_k=1, dim=-1) # 如果温度为0，则直接使用topk函数获取概率最大的token，即不考虑输出的多样性
+            else:
+                logits = logits / temperature
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)), sorted=True) # v: 形状为[batch_size, k=min(top_k, logits.size(-1))]
+                    logits[logits < v[:,[-1]]] = -float('inf') 
+                    # v[:,[-1]]：形状为[batch_size, 1]，表示v的最后一个元素, 也是v中第看大（最小的）的元素；logits < v[:,[-1]]返回的是bool张量
+                    # logits[logits < v[:,[-1]]]：logits中所有小于v中第k大元素的元素都被设置为-inf，即将logits < v[:,[-1]]中为True的元素设置为-inf
+
+                probs = F.softmax(logits, dim=-1) # 使用softmax函数计算概率分布
+                id_next = torch.multinomial(probs, num_samples=1, generator=None) # 使用多重采样函数获取下一个token
+
+            if idx_next == eos:
+                break # 如果下一个token是结束token，则停止生成
+
+            idx = torch.cat((idx, id_next), dim=-1) # 将当前token和下一个token拼接起来
+
+            if stream:
+                yield idx[:, index:] # 如果stream为True，则返回从初始位置到当前的所有新的token
         
+        if not stream:
+            yield idx[:, index:] 
 
-    
+    @torch.inference_mode() # 装饰器，用于告诉PyTorch，这个函数在推理生成过程中不需要计算梯度
+    def eval_func(self, idx):
+        '''
+        进行单步预测，并且返回原始的logits，用于模型评估/计算其他评估指标
+        '''
+        idx_cond = idx if idx.shape[1] <= self.params.max_seq_length else idx[:, -self.params.max_seq_length:]
+        # 如果idx的长度大于max_seq_length，则只取最后max_seq_length个token, 否则直接返回idx
+        inference_res = self(idx_cond)
+        logits = inference_res.logits[:, -1, :]
+        return logits
 
 
 
