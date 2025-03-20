@@ -475,15 +475,14 @@ class Transformer(PreTrainedModel):
 
         self.apply(self._init_weights) # 使用_init_weights函数初始化模型参数; apply()函数会遍历模型的所有子模块，并调用_init_weights函数初始化每个子模块的参数
         '''(torch.nn.apply(fn)是深度优先搜索)'''
-
         for pn, p in self.named_parameters(): # 遍历模型中的所有参数, named_parameters()返回一个生成器，生成器中的每个元素是一个包含参数名称和参数值的元组
-            if pn.endswith('w3.weight') or pn.endswith('wo.weight'): # 如果参数名称以'w3.weight'或'wo.weight'结尾
+            if pn.endswith('w3.weight') or pn.endswith('wo.weight'): # 如果参数名称以'w3.weight'或'wo.weight'结尾，w3是门控机制FFN(x)=(Swish(xW1)⊙xW2)W3中的W3，wo是输出层的权重矩阵
                 torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * self.params.n_layers)) 
                 # 使用正态分布初始化参数，均值为0，标准差为0.02除以sqrt(2 * n_layers), 通过缩小深层网络特定层权重的初始化标准差，平衡网络深度带来的梯度衰减/爆炸问题
                 # 在训练深层Transformer类模型时，这种初始化策略能提升收敛速度和稳定性
                 # 式子中的0.02和2都是经验值，也是需要根据实际情况进行调整的超参数
         self.loss = None # 初始化损失为None
-        self.OUT = CausalLMOutputWithPast # 初始化输出为CausalLMOutputWithPast
+        self.OUT = CausalLMOutputWithPast() # 初始化输出为CausalLMOutputWithPast
         '''
         CausalLMOutputWithPast: 一种因果语言模型输出，包含预测的下一个token概率分布和损失
         '''
