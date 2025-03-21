@@ -50,5 +50,30 @@ class PretrainDataset(Dataset):
         y = sample[1:].astype(np.int64) # 获取样本的后maxlength-1个元素
         return torch.from_numpy(x), torch.from_numpy(y) # 将x和y转换为torch.Tensor类型
         
-                
-                
+
+#处理用于微调的SFT数据集
+class SFTDataset(Dataset):
+    def __init__(self, df, tokenizer, maxlength=1024, prompt_maxlength=512, answer_maxlength=512):
+        super().__init__()
+        self.df = df # 数据集
+        self.tokenizer = tokenizer # 分词器
+        self.maxlength = maxlength # 最大序列长度
+        self.prompt_maxlength = prompt_maxlength # 提示最大长度
+        self.answer_maxlength = answer_maxlength # 答案最大长度
+        #
+        self.padding = 0 # 填充id
+        self.bos_id = self.tokenizer('<s>assistant').data['input_ids']
+        # 在对话模型中，a要明确区分用户（user）和助手（assistant）的角色。此处通过 <s>assistant 标记助手的回复开始，帮助模型理解生成内容的边界。
+        # self.tokenizer('<s>assistant') 使用分词器将 '<s>assistant' 转换为 token 序列,生成一个字典，字典的键为 'input_ids'，值为 token 序列
+        # .data['input_ids'] 获取字典的 'input_ids' 键对应的值，即 token 序列:提取编码后的token序列
+
+
+    def __len__(self):
+        return len(self.df)
+    
+    def find_sublist_idx(self, sublist, mainlist) -> int:
+        last_idx = -1
+        for i in range(len(mainlist) - len(sublist)+1):
+            if mainlist[i : i+len(sublist)] == sublist:
+                last_idx = i
+        return last_idx
