@@ -69,11 +69,19 @@ class SFTDataset(Dataset):
 
 
     def __len__(self):
-        return len(self.df)
+        return len(self.df) # 用于获取数据集的长度
     
     def find_sublist_idx(self, sublist, mainlist) -> int:
-        last_idx = -1
-        for i in range(len(mainlist) - len(sublist)+1):
+        '''
+        sublist: 子列表
+        mainlist: 主列表
+        '''
+        last_idx = -1 # 初始化last_idx为-1
+        for i in range(len(mainlist) - len(sublist) + 1):
+            # 遍历主列表，找到子列表的索引, 只需要遍历到len(mainlist) - len(sublist) + 1即可
             if mainlist[i : i+len(sublist)] == sublist:
-                last_idx = i
+                # 主列表的切片与子列表相等，则返回当前索引
+                last_idx = i # 更新last_idx，记录子列表在主列表中的索引
         return last_idx
+
+    
